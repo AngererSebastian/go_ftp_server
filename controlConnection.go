@@ -14,8 +14,8 @@ var command_handlers map[string] func(FtpConnection, string) error = map[string]
 	"LIST": nil,
 	"RETR": nil,
 	"STOR": nil,
-	"MKD" : nil,
-	"PWD" : nil,
+	"MKD" : not_implemented,
+	"PWD" : not_implemented, // TODO maybe implement it
 }
 
 var ip_addr net.IP
@@ -64,6 +64,8 @@ type FtpConnection struct {
 	port uint16
 	data_channel chan net.Conn
 	is_passive bool
+
+	fs FileSystem
 }
 
 func fromConn(conn io.ReadWriteCloser) FtpConnection {
@@ -96,11 +98,19 @@ func quit(ftp FtpConnection, _ string) error {
 }
 
 func passive(ftp FtpConnection, _ string) error {
-	var port uint16
 	ftp.is_passive = true
 
 	go func() {
-		port = <- available_ports
+		port := <- available_ports
+
+		ftp.control.Cmd("227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).",
+			ip_addr[0],
+			ip_addr[1],
+			ip_addr[2],
+			ip_addr[3],
+			port >> 8,
+			port & 256,
+		)
 
 		err := listen_for_passive(ftp.data_channel, port)
 		if err != nil {
@@ -110,14 +120,6 @@ func passive(ftp FtpConnection, _ string) error {
 		available_ports <- port
 	}()
 
-	ftp.control.Cmd("227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).",
-		ip_addr[0],
-		ip_addr[1],
-		ip_addr[2],
-		ip_addr[3],
-		port >> 8, // TODO: grantee that port has been initialized
-
-	)
 	return nil
 }
 
@@ -136,5 +138,10 @@ func listen_for_passive(conn_chan chan net.Conn, port uint16) error {
 
 	available_ports <- port
 	conn_chan <- conn
+	return err
+}
+
+func not_implemented(ftp FtpConnection, _ string) error {
+	_, err := ftp.control.W.WriteString("202 Command not implemented, superfluous at this site.")
 	return err
 }

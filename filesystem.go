@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 )
 
+var INVALID_PATH error = errors.New("invalid path")
+var CANT_ACCESS_DIR error = errors.New("couldn't read dir")
 var PREFIX string = os.Getenv("FTP_PREFIX")
 
 type FileSystem struct {
@@ -21,19 +23,25 @@ func NewFs() FileSystem {
 }
 
 func (fs FileSystem) list(path string) (string, error) {
+	path, err := fs.proccess_path(path)
+	if err != nil {
+		return "", INVALID_PATH
+	}
+
 	files, err := os.ReadDir(path)
 	if err != nil {
-		return "", errors.New("couldn't read dir")
+		return "", CANT_ACCESS_DIR
 	}
 
 	var output strings.Builder
 
 	for _, file := range files {
 		output.WriteString(
-			fmt.Sprint(file.Type().String()),
+			fmt.Sprint(file.Type().String(), file.Name()),
 		)
 	}
 
+	fmt.Println(output.String())
 	return output.String(), nil
 }
 
@@ -41,6 +49,7 @@ func (fs FileSystem) proccess_path(path string) (string, error) {
 	var pre string
 	if path[0] == '/' {
 		pre = PREFIX
+		path = path[1:] //remove the first / TODO: check for more / at the beginning
 	} else {
 		pre = fs.current_dir
 	}

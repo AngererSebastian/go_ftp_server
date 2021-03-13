@@ -26,6 +26,7 @@ func main() {
 			return
 		}
 
-		go fromConn(conn).handle()
+		ftp_conn := fromConn(conn)
+		go ftp_conn.handle()
 	}
 }

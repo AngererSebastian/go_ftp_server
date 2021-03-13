@@ -4,21 +4,22 @@ import (
 	"fmt"
 	"net/textproto"
 	"net"
-	"io"
 )
 
-var command_handlers map[string] func(FtpConnection, string) error = map[string] func(FtpConnection, string) error{
+var command_handlers map[string] func(*FtpConnection, string) error = map[string] func(*FtpConnection, string) error{
+	"USER": user,
 	"QUIT": quit,
-	"PORT": nil,
+	"PORT": port,
 	"PASV": passive,
 	"LIST": nil,
 	"RETR": nil,
 	"STOR": nil,
 	"MKD" : not_implemented,
 	"PWD" : not_implemented, // TODO maybe implement it
+	"TYPE": not_implemented,
+	"MODE": not_implemented,
+	"STRU": not_implemented,
 }
-
-var ip_addr net.IP
 
 var available_ports chan uint16 = make(chan uint16, 50)
 
@@ -29,62 +30,52 @@ func init_connectors() error {
 		available_ports <- i
 	}
 
-	// gets all addresses of all Interfaces
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return err
-	}
-
-	// and gets an IPv4 addr
-	for _, addr := range addrs {
-		switch v := addr.(type) {
-			case *net.IPNet:
-			case *net.IPAddr:
-				ip_addr = v.IP
-		}
-		if ip_addr == nil || ip_addr.IsLoopback() {
-			continue
-		}
-
-		ip_addr = ip_addr.To4()
-		if ip_addr == nil { // not an IPv4 addr
-			continue
-		}
-		break
-	}
 	return nil
 }
 
 type FtpConnection struct {
 	control *textproto.Conn
-	data *net.Conn
 
-	current_dir string
-
-	port uint16
+	client_addr net.TCPAddr
+	local_ip_addr net.IP // our ip addr
+	/// if passive a connection will be send through here
 	data_channel chan net.Conn
 	is_passive bool
 
+	// a quit has been issued
+	is_quitting bool
+
+	// the filesystem (currently not needed)
 	fs FileSystem
 }
 
-func fromConn(conn io.ReadWriteCloser) FtpConnection {
+func fromConn(conn net.Conn) FtpConnection {
 	var ftp FtpConnection
 
 	ftp.control = textproto.NewConn(conn)
 	ftp.data_channel = make(chan net.Conn, 1)
+	ftp.is_passive = false
+	ftp.is_quitting = false
+
+	local_addr := conn.LocalAddr().(*net.TCPAddr)
+	ftp.local_ip_addr = local_addr.IP
+
 
 	return ftp
 }
 
-func (ftp FtpConnection) handle() error {
+func (ftp *FtpConnection) handle() error {
 	var command string
 	var args string
 
-	for command != "QUIT" {
-		_, err := fmt.Fscanf(ftp.control.R, "%s %s\r\n", &command, &args)
-		if err != nil {
-			return err
+	for !ftp.is_quitting {
+		n, err := fmt.Fscanf(ftp.control.R, "%s %s\r\n", &command, &args)
+		if err != nil  {
+			if n == 1 {
+				args = ""
+			} else {
+				return err
+			}
 		}
 
 		command_handlers[command](ftp, args)
@@ -93,26 +84,28 @@ func (ftp FtpConnection) handle() error {
 	return nil
 }
 
-func quit(ftp FtpConnection, _ string) error {
+func quit(ftp *FtpConnection, _ string) error {
+	ftp.is_quitting = true
+	ftp.control.Cmd("221 Service closing control connection.")
 	return nil
 }
 
-func passive(ftp FtpConnection, _ string) error {
+func passive(ftp *FtpConnection, _ string) error {
 	ftp.is_passive = true
 
 	go func() {
 		port := <- available_ports
 
 		ftp.control.Cmd("227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).",
-			ip_addr[0],
-			ip_addr[1],
-			ip_addr[2],
-			ip_addr[3],
+			ftp.local_ip_addr[0],
+			ftp.local_ip_addr[1],
+			ftp.local_ip_addr[2],
+			ftp.local_ip_addr[3],
 			port >> 8,
 			port & 256,
 		)
 
-		err := listen_for_passive(ftp.data_channel, port)
+		err := listen_for_passive(ftp, port)
 		if err != nil {
 			fmt.Println("Couldn't listen on port ", port, " because of ", err.Error())
 		}
@@ -123,25 +116,59 @@ func passive(ftp FtpConnection, _ string) error {
 	return nil
 }
 
-func listen_for_passive(conn_chan chan net.Conn, port uint16) error {
+func port(ftp *FtpConnection, args string) error {
+	var addr net.IP
+	var port1, port2 int
+
+	_, err := fmt.Sscanf(args, "%d,%d,%d,%d,%d,%d",
+		&addr[0],
+		&addr[1],
+		&addr[2],
+		&addr[3],
+		&port1,
+		&port2,
+	)
+	if err != nil {
+		ftp.control.Cmd("501 Syntax error in parameters or arguments.")
+		return err
+	}
+
+
+	ftp.client_addr = net.TCPAddr{
+		IP: addr,
+		Port: (port1 << 8) + port2,
+	}
+
+	ftp.control.Cmd("200 Port aknowledged")
+	return nil
+}
+
+func user(ftp *FtpConnection, _ string) error {
+	ftp.control.Cmd("230 User logged in, proceed.")
+	return nil
+}
+
+func listen_for_passive(ftp *FtpConnection, port uint16) error {
 	listener, err := net.Listen("tcp", fmt.Sprint(":", port))
 	if err != nil {
 		return err
 	}
 
-	conn, err := listener.Accept()
-	if err != nil {
-		return err
+	for !ftp.is_quitting {
+		conn, err := listener.Accept()
+		if err != nil {
+			return err
+		}
+
+		available_ports <- port
+		ftp.data_channel <- conn
 	}
 
 	err = listener.Close()
-
-	available_ports <- port
-	conn_chan <- conn
 	return err
 }
 
-func not_implemented(ftp FtpConnection, _ string) error {
+func not_implemented(ftp *FtpConnection, _ string) error {
 	_, err := ftp.control.W.WriteString("202 Command not implemented, superfluous at this site.")
 	return err
 }

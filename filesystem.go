@@ -2,9 +2,9 @@ package main
 
 import (
 	"os"
-	"strings"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 )
 
@@ -22,32 +22,25 @@ func NewFs() FileSystem {
 	}
 }
 
-func (fs FileSystem) list(path string) (string, error) {
-	path, err := fs.proccess_path(path)
-	if err != nil {
-		return "", INVALID_PATH
-	}
-
+func (fs FileSystem) list(w io.Writer, path string) error {
 	files, err := os.ReadDir(path)
 	if err != nil {
-		return "", CANT_ACCESS_DIR
+		return CANT_ACCESS_DIR
 	}
-
-	var output strings.Builder
 
 	for _, file := range files {
-		output.WriteString(
-			fmt.Sprint(file.Type().String(), file.Name()),
-		)
+		fmt.Println(file.Name())
+		fmt.Fprint(w, file.Name(), "\r\n")
 	}
 
-	fmt.Println(output.String())
-	return output.String(), nil
+	return nil
 }
 
 func (fs FileSystem) proccess_path(path string) (string, error) {
 	var pre string
-	if path[0] == '/' {
+	if path == "" {
+		path = fs.current_dir
+	} else if path[0] == '/' {
 		pre = PREFIX
 		path = path[1:] //remove the first / TODO: check for more / at the beginning
 	} else {

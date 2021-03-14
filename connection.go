@@ -1,10 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"net/textproto"
 	"net"
+	"net/textproto"
+	"strings"
 )
+
+const NUMBER_PORT_AVAIL = 50
 
 var command_handlers map[string] func(*FtpConnection, string) error =
 	map[string] func(*FtpConnection, string) error{
@@ -13,25 +17,19 @@ var command_handlers map[string] func(*FtpConnection, string) error =
 		"SYST": syst,
 		"PORT": port,
 		"PASV": passive,
-		"EPSV": nil
-		"EPRT": nil // TODO: https://tools.ietf.org/html/rfc2428
 		"LIST": list,
 		"RETR": nil,
 		"STOR": nil,
-		"MKD" : not_implemented,
-		"PWD" : not_implemented, // TODO maybe implement it
-		"TYPE": not_implemented,
-		"MODE": not_implemented,
-		"STRU": not_implemented,
-		"FEAT": not_implemented,
+		"FEAT": feat,
+		"PWD" : print_working_dir,
 }
 
-var available_ports chan uint16 = make(chan uint16, 50)
+var available_ports chan uint16 = make(chan uint16, NUMBER_PORT_AVAIL)
 
 func init_connectors() error {
 
 	// adds all available ports to a "quere"/channel
-	for i := uint16(12040); i <= 12090; i++ {
+	for i := uint16(12040); i < 12040 + NUMBER_PORT_AVAIL; i++ {
 		available_ports <- i
 	}
 
@@ -57,6 +55,8 @@ type FtpConnection struct {
 
 	// the filesystem (currently not needed)
 	fs FileSystem
+	// for logging
+	remote net.Addr
 }
 
 func fromConn(conn net.Conn) FtpConnection {
@@ -69,6 +69,7 @@ func fromConn(conn net.Conn) FtpConnection {
 
 	local_addr := conn.LocalAddr().(*net.TCPAddr)
 	ftp.local_ip_addr = local_addr.IP
+	ftp.remote = conn.RemoteAddr()
 
 	fmt.Println("Connected to ", conn.RemoteAddr())
 
@@ -77,6 +78,7 @@ func fromConn(conn net.Conn) FtpConnection {
 }
 
 func (ftp *FtpConnection) handle() error {
+	defer ftp.control.Close()
 	var command string
 	var args string
 
@@ -92,9 +94,15 @@ func (ftp *FtpConnection) handle() error {
 			}
 		}
 
-		fmt.Println("got ", command, " ", args)
+		fmt.Printf("%s -> %s %s\n", ftp.remote.String(), command, args)
 
-		command_handlers[command](ftp, args)
+		handler := command_handlers[command]
+
+		if handler == nil {
+			not_implemented(ftp, args)
+		} else {
+			handler(ftp, args)
+		}
 	}
 
 	return nil
@@ -111,6 +119,7 @@ func passive(ftp *FtpConnection, _ string) error {
 
 	go func() {
 		port := <- available_ports
+		fmt.Printf("%s -> got port %d\n", ftp.remote.String(), port)
 
 		ftp.control.Cmd("227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).",
 			ftp.local_ip_addr[0],
@@ -133,7 +142,7 @@ func passive(ftp *FtpConnection, _ string) error {
 }
 
 func port(ftp *FtpConnection, args string) error {
-	var addr net.IP
+	var addr []byte = make([]byte, 4)
 	var port1, port2 int
 
 	_, err := fmt.Sscanf(args, "%d,%d,%d,%d,%d,%d",
@@ -170,20 +179,38 @@ func syst(ftp *FtpConnection, _ string) error {
 	return nil
 }
 
+func print_working_dir(ftp *FtpConnection, _ string) error {
+	_, err := ftp.control.Cmd("257 \"%s\" is the current dir", ftp.fs.current_dir)
+	return err
+}
+
 func list(ftp *FtpConnection, args string) error {
+	if len(strings.Split(args, " ")) > 1 {
+		ftp.control.Cmd("501 Syntax error in parameters or arguments.")
+		return errors.New("too many arguments")
+	}
+
+	path, err := ftp.fs.proccess_path(args)
+	if err != nil {
+		ftp.control.Cmd("550 %s", err.Error())
+		return err
+	}
+
 	go func() {
+		ftp.control.Cmd("150 File status okay; about to open data connection")
 		data, err := ftp.open_data_conn()
+		defer data.Close()
+
 		if err != nil {
 			return
 		}
 
-		result, err := ftp.fs.list(args)
+		err = ftp.fs.list(data, path)
 		if err == nil {
 		} else if err == INVALID_PATH {
 		}
 
-		data.Write([]byte(result))
-
+		ftp.control.Cmd("226 Closing data connection")
 	}()
 
 	return nil
@@ -191,12 +218,14 @@ func list(ftp *FtpConnection, args string) error {
 
 func listen_for_passive(ftp *FtpConnection, port uint16) error {
 	listener, err := net.Listen("tcp", fmt.Sprint(":", port))
+	defer listener.Close()
 	if err != nil {
 		return err
 	}
 
 	for !ftp.is_quitting {
 		conn, err := listener.Accept()
+		fmt.Println("accecpted data connection from", conn.RemoteAddr().String())
 
 		available_ports <- port
 		ftp.data_channel <- ConnectionWithError {
@@ -205,8 +234,7 @@ func listen_for_passive(ftp *FtpConnection, port uint16) error {
 		}
 	}
 
-	err = listener.Close()
-	return err
+	return nil
 }
 
 func (ftp *FtpConnection) open_data_conn() (net.Conn, error) {
@@ -219,6 +247,7 @@ func (ftp *FtpConnection) open_data_conn() (net.Conn, error) {
 		err = tmp.err
 	} else {
 		conn, err = net.Dial("tcp", ftp.client_addr.String())
+		fmt.Println("establishing active data conn with ", ftp.client_addr.String())
 	}
 
 	if err != nil {
@@ -230,5 +259,10 @@ func (ftp *FtpConnection) open_data_conn() (net.Conn, error) {
 
 func not_implemented(ftp *FtpConnection, _ string) error {
 	_, err := ftp.control.W.WriteString("502 Command not implemented, superfluous at this site.")
+	return err
+}
+
+func feat(ftp *FtpConnection, _ string) error {
+	_, err := ftp.control.Cmd("211 No Features.")
 	return err
 }

@@ -18,8 +18,8 @@ var command_handlers map[string] func(*FtpConnection, string) error =
 		"PORT": port,
 		"PASV": passive,
 		"LIST": list,
-		"RETR": nil,
-		"STOR": nil,
+		"RETR": retrieve,
+		"STOR": store,
 		"FEAT": feat,
 		"PWD" : print_working_dir,
 }
@@ -48,10 +48,13 @@ type FtpConnection struct {
 	local_ip_addr net.IP // our ip addr
 	/// if passive a connection will be send through here
 	data_channel chan ConnectionWithError
-	is_passive bool
 
 	// a quit has been issued
 	is_quitting bool
+	// should it open an active or passive data connection
+	is_passive bool
+	// binary file transfer mode (only ascii and bin is implemented)
+	is_binary bool
 
 	// the filesystem (currently not needed)
 	fs FileSystem
@@ -66,10 +69,12 @@ func fromConn(conn net.Conn) FtpConnection {
 	ftp.data_channel = make(chan ConnectionWithError, 1)
 	ftp.is_passive = false
 	ftp.is_quitting = false
+	ftp.is_binary = false
 
 	local_addr := conn.LocalAddr().(*net.TCPAddr)
 	ftp.local_ip_addr = local_addr.IP
 	ftp.remote = conn.RemoteAddr()
+	ftp.fs = NewFs()
 
 	fmt.Println("Connected to ", conn.RemoteAddr())
 
@@ -185,19 +190,12 @@ func print_working_dir(ftp *FtpConnection, _ string) error {
 }
 
 func list(ftp *FtpConnection, args string) error {
-	if len(strings.Split(args, " ")) > 1 {
-		ftp.control.Cmd("501 Syntax error in parameters or arguments.")
-		return errors.New("too many arguments")
-	}
-
-	path, err := ftp.fs.proccess_path(args)
+	path, err := check_file(ftp, args)
 	if err != nil {
-		ftp.control.Cmd("550 %s", err.Error())
 		return err
 	}
 
 	go func() {
-		ftp.control.Cmd("150 File status okay; about to open data connection")
 		data, err := ftp.open_data_conn()
 		defer data.Close()
 
@@ -208,6 +206,60 @@ func list(ftp *FtpConnection, args string) error {
 		err = ftp.fs.list(data, path)
 		if err == nil {
 		} else if err == INVALID_PATH {
+			ftp.control.Cmd("550 %s", err.Error())
+		}
+
+		ftp.control.Cmd("226 Closing data connection")
+	}()
+
+	return nil
+}
+
+func retrieve(ftp *FtpConnection, args string) error {
+	path, err := check_file(ftp, args)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		data_conn, err := ftp.open_data_conn()
+		defer data_conn.Close()
+
+		if err != nil {
+			return
+		}
+
+		err = ftp.fs.retrieve_file(data_conn, path, ftp.is_binary)
+		if err == CANT_ACCESS_FILE {
+			ftp.control.Cmd("550 %s", err.Error())
+		} else if err != nil {
+			ftp.control.Cmd("552 action aborted")
+		}
+
+		ftp.control.Cmd("226 Closing data connection")
+	}()
+	return nil
+}
+
+func store(ftp *FtpConnection, args string) error {
+	path, err := check_file(ftp, args)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		data_conn, err := ftp.open_data_conn()
+		defer data_conn.Close()
+
+		if err != nil {
+			return
+		}
+
+		err = ftp.fs.store_file(data_conn, path, ftp.is_binary)
+		if err == CANT_ACCESS_FILE {
+			ftp.control.Cmd("550 %s", err.Error())
+		} else if err != nil {
+			ftp.control.Cmd("552 action aborted")
 		}
 
 		ftp.control.Cmd("226 Closing data connection")
@@ -252,6 +304,8 @@ func (ftp *FtpConnection) open_data_conn() (net.Conn, error) {
 
 	if err != nil {
 		ftp.control.Cmd("425 Can't open data connection.")
+	} else {
+		ftp.control.Cmd("150 File status okay; about to open data connection")
 	}
 
 	return conn, err
@@ -265,4 +319,17 @@ func not_implemented(ftp *FtpConnection, _ string) error {
 func feat(ftp *FtpConnection, _ string) error {
 	_, err := ftp.control.Cmd("211 No Features.")
 	return err
+}
+
+func check_file(ftp *FtpConnection, args string) (string, error) {
+	if len(strings.Split(args, " ")) > 1 {
+		ftp.control.Cmd("501 Syntax error in parameters or arguments.")
+		return "", errors.New("too many arguments")
+	}
+
+	path, err := ftp.fs.proccess_path(args)
+	if err != nil {
+		ftp.control.Cmd("550 %s", err.Error())
+	}
+	return path, err
 }

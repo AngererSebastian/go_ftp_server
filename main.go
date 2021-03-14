@@ -16,10 +16,7 @@ func main() {
 		return
 	}
 
-	defer func() {
-		fmt.Print("Shutting down server\n")
-		listener.Close()
-	}()
+	defer listener.Close()
 
 	for {
 		conn, err := listener.Accept();

@@ -62,26 +62,25 @@ type FtpConnection struct {
 	remote net.Addr
 }
 
+/* ceates an FtpConnection from an net.Conn*/
 func fromConn(conn net.Conn) FtpConnection {
-	var ftp FtpConnection
-
-	ftp.control = textproto.NewConn(conn)
-	ftp.data_channel = make(chan ConnectionWithError, 1)
-	ftp.is_passive = false
-	ftp.is_quitting = false
-	ftp.is_binary = false
-
-	local_addr := conn.LocalAddr().(*net.TCPAddr)
-	ftp.local_ip_addr = local_addr.IP
-	ftp.remote = conn.RemoteAddr()
-	ftp.fs = NewFs()
 
 	fmt.Println("Connected to ", conn.RemoteAddr())
+	local_addr := conn.LocalAddr().(*net.TCPAddr)
 
-
-	return ftp
+	return FtpConnection {
+		control:		textproto.NewConn(conn),
+		data_channel:	make(chan ConnectionWithError, 1),
+		is_passive:		false,
+		is_quitting:	false,
+		is_binary:		false,
+		local_ip_addr:	local_addr.IP,
+		remote:			conn.RemoteAddr(),
+		fs:				NewFs(),
+	}
 }
 
+/* handles all interaction with that connection*/
 func (ftp *FtpConnection) handle() error {
 	defer ftp.control.Close()
 	var command string
@@ -113,12 +112,16 @@ func (ftp *FtpConnection) handle() error {
 	return nil
 }
 
+/* handles the QUIT command, it brings the connection to a close*/
 func quit(ftp *FtpConnection, _ string) error {
 	ftp.is_quitting = true
 	ftp.control.Cmd("221 Service closing control connection.")
 	return nil
 }
 
+
+/* puts the connetion into passive mode so it listens for
+	incoming data connection on a random port */
 func passive(ftp *FtpConnection, _ string) error {
 	ftp.is_passive = true
 
@@ -146,10 +149,12 @@ func passive(ftp *FtpConnection, _ string) error {
 	return nil
 }
 
+/* specifies the port the server should connect to for a data connection*/
 func port(ftp *FtpConnection, args string) error {
 	var addr []byte = make([]byte, 4)
 	var port1, port2 int
 
+	// parse arguments first 4 are the bytes of the ip addr and last 2 of the port
 	_, err := fmt.Sscanf(args, "%d,%d,%d,%d,%d,%d",
 		&addr[0],
 		&addr[1],
@@ -166,29 +171,34 @@ func port(ftp *FtpConnection, args string) error {
 
 	ftp.client_addr = net.TCPAddr{
 		IP: addr,
-		Port: (port1 << 8) + port2,
+		Port: (port1 << 8) + port2, // get the port back togther
 	}
 
 	ftp.control.Cmd("200 Port aknowledged")
 	return nil
 }
 
+/* HANDLES the user command*/
 func user(ftp *FtpConnection, _ string) error {
+	// this server doesn't have any users so accept everyone
 	ftp.control.Cmd("230 User logged in, proceed.")
 	return nil
 }
 
+/* HANDLES the SYST command, which just gives the system of the server*/
 func syst(ftp *FtpConnection, _ string) error {
 	ftp.control.Cmd("215 UNIX system type.")
 
 	return nil
 }
 
+/* handles the PWD command, just gives the current dir*/
 func print_working_dir(ftp *FtpConnection, _ string) error {
 	_, err := ftp.control.Cmd("257 \"%s\" is the current dir", ftp.fs.current_dir)
 	return err
 }
 
+/* handles the LIST command, writes the contents of a given directory*/
 func list(ftp *FtpConnection, args string) error {
 	path, err := check_file(ftp, args)
 	if err != nil {
@@ -215,6 +225,7 @@ func list(ftp *FtpConnection, args string) error {
 	return nil
 }
 
+/* handles RETR command, gets the specified file*/
 func retrieve(ftp *FtpConnection, args string) error {
 	path, err := check_file(ftp, args)
 	if err != nil {
@@ -241,6 +252,7 @@ func retrieve(ftp *FtpConnection, args string) error {
 	return nil
 }
 
+/* handles the STOR command, puts a file on the server*/
 func store(ftp *FtpConnection, args string) error {
 	path, err := check_file(ftp, args)
 	if err != nil {
@@ -268,14 +280,15 @@ func store(ftp *FtpConnection, args string) error {
 	return nil
 }
 
+/* command that listens for a passive connection*/
 func listen_for_passive(ftp *FtpConnection, port uint16) error {
 	listener, err := net.Listen("tcp", fmt.Sprint(":", port))
-	defer listener.Close()
 	if err != nil {
 		return err
 	}
+	defer listener.Close()
 
-	for !ftp.is_quitting {
+	for !ftp.is_quitting && ftp.is_passive {
 		conn, err := listener.Accept()
 		fmt.Println("accecpted data connection from", conn.RemoteAddr().String())
 
@@ -289,6 +302,7 @@ func listen_for_passive(ftp *FtpConnection, port uint16) error {
 	return nil
 }
 
+/* opends a data connection, be it passively or active*/
 func (ftp *FtpConnection) open_data_conn() (net.Conn, error) {
 	var conn net.Conn
 	var err error
@@ -311,6 +325,7 @@ func (ftp *FtpConnection) open_data_conn() (net.Conn, error) {
 	return conn, err
 }
 
+/* command handler which says this command isn't implemented*/
 func not_implemented(ftp *FtpConnection, _ string) error {
 	_, err := ftp.control.W.WriteString("502 Command not implemented, superfluous at this site.")
 	return err
@@ -321,6 +336,7 @@ func feat(ftp *FtpConnection, _ string) error {
 	return err
 }
 
+/* checks if a file is valid and returns the valid absolut path*/
 func check_file(ftp *FtpConnection, args string) (string, error) {
 	if len(strings.Split(args, " ")) > 1 {
 		ftp.control.Cmd("501 Syntax error in parameters or arguments.")
